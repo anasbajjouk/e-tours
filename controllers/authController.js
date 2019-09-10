@@ -4,24 +4,41 @@ const catchAsync = require('../utils/catchAsync');
 const jwt = require('jsonwebtoken');
 const AppError = require('../utils/appError');
 const sendEmail = require('../utils/email');
+const crypto = require('crypto');
 
 const signToken = id => {
   return jwt.sign({ id }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN
   });
 };
-exports.signUp = catchAsync(async (request, response, next) => {
-  const newUser = await User.create(request.body);
 
-  const token = signToken(newUser._id);
+const createSendToken = (user, statusCode, response) => {
+  const token = signToken(user._id);
+  const cookieOptions = {
+    expires: new Date(
+      Date.now() + process.env.JWT_COOKIE_EXPIRES_IN * 24 * 60 * 60 * 1000 //to milliseconds
+    ),
+    httpOnly: true
+  };
 
-  response.status(201).json({
+  if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
+  response.cookie('jwt', token, cookieOptions);
+
+  //Remove the password from the output
+  user.password = undefined;
+
+  response.status(statusCode).json({
     status: 'success',
     token,
     data: {
-      user: newUser
+      user
     }
   });
+};
+
+exports.signUp = catchAsync(async (request, response, next) => {
+  const newUser = await User.create(request.body);
+  createSendToken(newUser, 201, response);
 });
 
 exports.login = catchAsync(async (request, response, next) => {
@@ -33,16 +50,14 @@ exports.login = catchAsync(async (request, response, next) => {
   }
   //Check if user exists && passowrd is correct
   const user = await User.findOne({ email }).select('+password');
+
   //const correctPass = await user.correctPassword(password, user.password);
   if (!user || !(await user.correctPassword(password, user.password))) {
     return next(new AppError('Incorrect email or password', 401));
   }
+
   //If everything is ok, send token to client
-  const token = signToken(user._id);
-  response.status(201).json({
-    status: 'success',
-    token
-  });
+  createSendToken(user, 200, response);
 });
 
 exports.protect = catchAsync(async (request, response, next) => {
@@ -52,7 +67,8 @@ exports.protect = catchAsync(async (request, response, next) => {
     request.headers.authorization &&
     request.headers.authorization.startsWith('Bearer')
   ) {
-    token = request.hearder.authorization.split(' ')[1];
+    token = request.headers.authorization.split(' ')[1];
+    console.log('here 2 :', token);
   }
 
   if (!token) {
@@ -137,4 +153,47 @@ exports.forgotPassword = catchAsync(async (request, response, next) => {
   }
 });
 
-exports.resetPassword = (request, response, next) => {};
+exports.resetPassword = catchAsync(async (request, response, next) => {
+  //Get user based on the token
+  const hashedToken = crypto
+    .createHash('sha256')
+    .update(request.params.token)
+    .digest('hex');
+
+  const user = await User.findOne({
+    passwordResetToken: hashedToken,
+    passwordResetExpires: { $gt: Date.now() }
+  });
+
+  //If token has not expired and there is a user, set the new password
+  if (!user) return next(new AppError('Token is invalid or has expired', 400));
+  user.password = request.body.password;
+  user.passwordConfirm = request.body.passwordConfirm;
+  user.passwordResetExpires = undefined;
+  user.passwordResetToken = undefined;
+  await user.save();
+
+  //Update changedPasswordAt property for the user
+
+  //Log the user in, send JWT
+  createSendToken(newUser, 200, response);
+});
+
+exports.updatePassword = catchAsync(async (request, response, next) => {
+  //Get user from the collection
+  const user = await User.findById(reques.user.id).select('+password');
+
+  //Check if posted current password is correct
+  if (
+    !(await user.correctPassword(requesr.body.passwordCurrent, user.password))
+  )
+    return next(new AppError('Your current password is wrong', 401));
+
+  //If so update password
+  user.password = request.body.password;
+  user.passwordConfirm = request.body.passwordConfirm;
+  await user.save();
+
+  //Log user in, send JWT
+  createSendToken(user, 200, response);
+});
